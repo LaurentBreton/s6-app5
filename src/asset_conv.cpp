@@ -12,6 +12,8 @@
 #include <string>
 #include <cstring>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
 
 namespace gif643 {
 
@@ -112,6 +114,7 @@ class TaskRunner
 {
 private:
     TaskDef task_def_;
+    PNGDataPtr data_ptr;
 
 public:
     TaskRunner(const TaskDef& task_def):
@@ -164,8 +167,8 @@ public:
 
             // Write it out ...
             std::ofstream file_out(fname_out, std::ofstream::binary);
-            auto data = writer.getData();
-            file_out.write(&(data->front()), data->size());
+            data_ptr = writer.getData();
+            file_out.write(&(data_ptr->front()), data_ptr->size());
             
         } catch (std::runtime_error e) {
             std::cerr << "Exception while processing "
@@ -184,6 +187,10 @@ public:
                   << fname_in 
                   << "." 
                   << std::endl;
+    }
+
+    PNGDataPtr get_data(){
+        return data_ptr;
     }
 };
 
@@ -211,11 +218,14 @@ private:
     // The cache hash map (TODO). Note that we use the string definition as the // key.
     using PNGHashMap = std::unordered_map<std::string, PNGDataPtr>;
     PNGHashMap png_cache_;
-
+    
     bool should_run_;           // Used to signal the end of the processor to
                                 // threads.
 
     std::vector<std::thread> queue_threads_;
+    std::mutex queue_mutex_;
+    std::mutex hash_mutex_;
+    std::condition_variable cond_var;
 
 public:
     /// \brief Default constructor.
@@ -226,7 +236,8 @@ public:
     /// \param n_threads: Number of threads (default: NUM_THREADS)
     Processor(int n_threads = NUM_THREADS):
         should_run_(true)
-    {
+    {   
+        
         if (n_threads <= 0) {
             std::cerr << "Warning, incorrect number of threads ("
                       << n_threads
@@ -312,6 +323,8 @@ public:
         if (parse(line_org, def)) {
             std::cerr << "Queueing task '" << line_org << "'." << std::endl;
             task_queue_.push(def);
+            cond_var.notify_one();
+
         }
     }
 
@@ -326,11 +339,39 @@ private:
     void processQueue()
     {
         while (should_run_) {
-            if (!task_queue_.empty()) {
-                TaskDef task_def = task_queue_.front();
-                task_queue_.pop();
+
+            std::unique_lock<std::mutex> lock(queue_mutex_);
+            cond_var.wait(lock, [this]{return !queueEmpty();});
+        
+            TaskDef task_def = task_queue_.front();
+            task_queue_.pop();
+            lock.unlock();
+
+
+
+            hash_mutex_.lock();
+            auto iterator = png_cache_.find(task_def.fname_in);
+            if(iterator == png_cache_.end())
+            {   
+                hash_mutex_.unlock();
                 TaskRunner runner(task_def);
                 runner();
+
+                PNGDataPtr ptr = runner.get_data();
+                hash_mutex_.lock();
+                png_cache_[task_def.fname_in] = ptr;
+                hash_mutex_.unlock();
+            }
+            else
+            {
+
+            PNGDataPtr ptr = png_cache_[task_def.fname_in];
+            hash_mutex_.unlock();
+            std::cerr << "Reusing data from " << task_def.fname_in << " for file " << task_def.fname_out << std::endl;
+            // Write it out ...
+            std::ofstream file_out(task_def.fname_out, std::ofstream::binary);
+            file_out.write(&(ptr->front()), ptr->size());
+
             }
         }
     }
@@ -358,9 +399,25 @@ int main(int argc, char** argv)
     } else {
         std::cerr << "Using stdin (press CTRL-D for EOF)." << std::endl;
     }
+    int num_thread = NUM_THREADS;
+    if(argc >= 3)
+    {
+        try
+        {
+            num_thread = atoi(argv[2]);
+            std::cerr << "running with "  << num_thread << " threads"<< std::endl;
+        }
+        catch(const std::exception& e)
+        {
+            std::cerr << argv[2] << " is not a valid thread count" << std::endl;
+            std::cerr << e.what() << '\n';
+            
+        }
+
+    }
 
     // TODO: change the number of threads from args.
-    Processor proc;
+    Processor proc(num_thread);
     
     while (!std::cin.eof()) {
 
@@ -379,3 +436,4 @@ int main(int argc, char** argv)
     // Wait until the processor queue's has tasks to do.
     while (!proc.queueEmpty()) {};
 }
+
